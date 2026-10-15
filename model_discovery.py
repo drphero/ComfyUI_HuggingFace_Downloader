@@ -642,7 +642,7 @@ def _extract_folder_names_from_ast_expr(
         fn = expr.func
         if (
             isinstance(fn, ast.Attribute)
-            and fn.attr == "get_filename_list"
+            and fn.attr in {"get_filename_list", "get_folder_paths"}
             and isinstance(fn.value, ast.Name)
             and fn.value.id == "folder_paths"
             and expr.args
@@ -650,9 +650,16 @@ def _extract_folder_names_from_ast_expr(
             and isinstance(expr.args[0].value, str)
         ):
             return _dedupe_preserve_order([expr.args[0].value])
-        if isinstance(fn, ast.Name) and fn.id in {"list", "tuple"} and expr.args:
+        if isinstance(fn, ast.Name) and fn.id in {"list", "tuple", "set", "sorted"} and expr.args:
             return _extract_folder_names_from_ast_expr(expr.args[0], folder_vars)
         return []
+
+    if isinstance(expr, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+        combined: list[str] = []
+        for gen in expr.generators:
+            combined.extend(_extract_folder_names_from_ast_expr(gen.iter, folder_vars))
+        combined.extend(_extract_folder_names_from_ast_expr(expr.elt, folder_vars))
+        return _dedupe_preserve_order(combined)
 
     if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
         left = _extract_folder_names_from_ast_expr(expr.left, folder_vars)
@@ -932,8 +939,24 @@ def _choose_best_folder_candidate(
         known_norm = normalize_save_path(known_dir) or known_dir
         for candidate in normalized:
             cand_norm = normalize_save_path(candidate) or candidate
-            if known_norm == cand_norm or known_norm.startswith(cand_norm + "/"):
-                return known_norm
+            if (
+                known_norm == cand_norm
+                or known_norm.startswith(cand_norm + "/")
+                or cand_norm.startswith(known_norm + "/")
+                or known_norm.replace("/", "_") == cand_norm.replace("/", "_")
+            ):
+                return candidate
+
+    if filename and ("/" in filename or "\\" in filename):
+        sub_prefix = filename.replace("\\", "/").split("/")[0].lower()
+        for candidate in normalized:
+            cand_lower = candidate.lower()
+            if (
+                cand_lower.endswith(sub_prefix)
+                or cand_lower.endswith("_" + sub_prefix)
+                or cand_lower.endswith("/" + sub_prefix)
+            ):
+                return candidate
 
     name_hint = _guess_folder_from_filename(filename)
     if name_hint and name_hint in normalized:
@@ -2283,15 +2306,33 @@ def check_model_files(found_models: List[Dict[str, Any]]) -> Tuple[List[Dict[str
         except KeyError:
             search_paths = []
 
+        if not search_paths and folder_type and ("/" in folder_type or "\\" in folder_type):
+            norm_folder = folder_type.replace("\\", "/")
+            for alt_key in [norm_folder.replace("/", "_"), norm_folder.split("/")[0]]:
+                try:
+                    search_paths = folder_paths.get_folder_paths(alt_key)
+                    if search_paths:
+                        break
+                except KeyError:
+                    continue
+
         if not search_paths:
             # Fallback to standard models/ structure if type unknown
             # This might not be ideal as folder_paths.get_folder_paths is the canonical way
             # but provides a safety net.
             comfy_root = getattr(folder_paths, "base_path", os.getcwd())
-            if folder_type and (os.path.isabs(folder_type) or _is_path_like(folder_type)):
-                search_paths = [folder_type if os.path.isabs(folder_type) else os.path.join(comfy_root, folder_type)]
+            models_dir = getattr(folder_paths, "models_dir", None) or os.path.join(comfy_root, "models")
+            if folder_type and os.path.isabs(folder_type):
+                search_paths = [folder_type]
+            elif folder_type and (folder_type.startswith("models/") or folder_type.startswith("models\\")):
+                search_paths = [os.path.join(comfy_root, folder_type)]
             else:
-                search_paths = [os.path.join(comfy_root, "models", folder_type)]
+                search_paths = [os.path.join(models_dir, folder_type)]
+                if "/" in folder_type.replace("\\", "/"):
+                    parent_rel = folder_type.replace("\\", "/").split("/")[0]
+                    parent_path = os.path.join(models_dir, parent_rel)
+                    if parent_path not in search_paths:
+                        search_paths.append(parent_path)
 
         found_path = None
         found_root = None
@@ -2363,7 +2404,12 @@ def check_model_files(found_models: List[Dict[str, Any]]) -> Tuple[List[Dict[str
             # If the requested filename doesn't match the found relative path, it's a mismatch
             # strict check: "foo.safetensors" vs "subfolder/foo.safetensors"
             if req_norm != found_norm:
-                 path_mismatches.append(model_entry)
+                prefix = req_norm[:-len(found_norm)].rstrip("/") if req_norm.endswith(found_norm) else ""
+                root_norm = found_root.rstrip("/\\").replace("\\", "/")
+                if prefix and (root_norm.endswith("/" + prefix) or root_norm == prefix):
+                    model_entry["clean_path"] = req_norm
+                else:
+                    path_mismatches.append(model_entry)
                  
         else:
             missing.append(model)

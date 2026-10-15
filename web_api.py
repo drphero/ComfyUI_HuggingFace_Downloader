@@ -2460,11 +2460,25 @@ def _resolve_model_search_paths(folder_hint: str) -> list[str]:
                 search_paths = folder_paths.get_folder_paths(safe_folder) or []
             except (KeyError, Exception):
                 search_paths = []
+        if not search_paths and ("/" in safe_folder or "\\" in safe_folder):
+            norm_f = safe_folder.replace("\\", "/")
+            for alt_key in [norm_f.replace("/", "_"), norm_f.split("/")[0]]:
+                try:
+                    search_paths = folder_paths.get_folder_paths(alt_key) or []
+                    if search_paths:
+                        break
+                except (KeyError, Exception):
+                    continue
 
     if not search_paths:
         models_root = _get_models_root()
         fallback = os.path.join(models_root, safe_folder)
         search_paths = [fallback]
+        if "/" in safe_folder.replace("\\", "/"):
+            parent_rel = safe_folder.replace("\\", "/").split("/")[0]
+            parent_fallback = os.path.join(models_root, parent_rel)
+            if parent_fallback not in search_paths:
+                search_paths.append(parent_fallback)
 
     normalized = []
     seen = set()
