@@ -28,6 +28,8 @@ from .file_manager import (
     get_allowed_model_roots,
     is_path_within_allowed_roots,
     sanitize_rel_folder,
+    get_model_folder_types,
+    suggest_model_folder,
 )
 from .model_discovery import process_workflow_for_missing_models, SearchCancelledException
 from .downloader import (
@@ -2380,6 +2382,81 @@ async def folder_structure(request):
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
+REPO_BROWSER_MODEL_EXTENSIONS = (".safetensors", ".gguf", ".ckpt", ".pt", ".pth", ".bin", ".sft", ".onnx")
+
+
+def _list_hf_repo_files(link: str) -> dict:
+    """List files in a Hugging Face repo with suggested ComfyUI destination folders."""
+    from huggingface_hub import HfApi
+    from huggingface_hub.hf_api import RepoFile
+
+    parsed = parse_link(link)
+    repo = parsed["repo"]
+    revision = str(parsed.get("revision") or "main")
+    subfolder = str(parsed.get("subfolder") or "").strip("/")
+
+    entries = HfApi().list_repo_tree(
+        repo,
+        path_in_repo=subfolder or None,
+        revision=revision,
+        recursive=True,
+        token=get_token(),
+    )
+    repo_paths = [entry for entry in entries if isinstance(entry, RepoFile)]
+    is_diffusers = any(entry.path == "model_index.json" for entry in repo_paths)
+    folder_types = get_model_folder_types()
+
+    files = []
+    for entry in repo_paths:
+        path = entry.path
+        name = os.path.basename(path)
+        is_model = name.lower().endswith(REPO_BROWSER_MODEL_EXTENSIONS)
+        suggested = "" if is_diffusers else suggest_model_folder(path, folder_types)
+        exists = False
+        if suggested:
+            try:
+                exists = os.path.exists(os.path.join(resolve_target_dir(suggested), name))
+            except Exception:
+                exists = False
+        files.append({
+            "path": path,
+            "dir": os.path.dirname(path),
+            "name": name,
+            "size": entry.size,
+            "is_model": is_model,
+            "suggested_folder": suggested,
+            "exists": exists,
+        })
+    files.sort(key=lambda f: (f["dir"].lower(), f["name"].lower()))
+    return {
+        "repo": repo,
+        "revision": revision,
+        "subfolder": subfolder,
+        "is_diffusers": is_diffusers,
+        "files": files,
+    }
+
+
+async def hf_repo_files(request):
+    """List a Hugging Face repo's files for the manual download repo browser."""
+    link = (request.query.get("link", "") or "").strip()
+    if not link:
+        return web.json_response({"error": "Missing repo link."}, status=400)
+    try:
+        result = await asyncio.to_thread(_list_hf_repo_files, link)
+        return web.json_response(result)
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+    except Exception as e:
+        status_code = getattr(getattr(e, "response", None), "status_code", None)
+        if status_code in (401, 403, 404):
+            return web.json_response(
+                {"error": "Repo not found, or it is gated/private and requires a Hugging Face token."},
+                status=404,
+            )
+        return web.json_response({"error": str(e)}, status=500)
+
+
 async def check_missing_models(request):
     """
     Analyzes the workflow JSON to find missing models.
@@ -3071,6 +3148,7 @@ def setup(app_or_server):
     _safe_add_route("POST", "/api/model_explorer/delete", model_explorer_delete)
 
     _safe_add_route("GET", "/folder_structure", folder_structure)
+    _safe_add_route("GET", "/hf_repo_files", hf_repo_files)
     _safe_add_route("GET", "/backup_browser_tree", backup_browser_tree)
     _safe_add_route("POST", "/create_hf_backup_repo", create_hf_backup_repo_endpoint)
     _safe_add_route("POST", "/backup_to_hf", backup_to_hf)

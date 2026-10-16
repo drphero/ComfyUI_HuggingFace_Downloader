@@ -81,6 +81,57 @@ def get_models_root() -> str:
     return os.path.join(get_comfy_root(), "models")
 
 
+FALLBACK_MODEL_FOLDER_TYPES = [
+    "checkpoints", "clip", "diffusion_models", "vae", "loras", "controlnet",
+    "upscale_models", "text_encoders", "style_models", "embeddings",
+]
+
+# Legacy folder names ComfyUI still maps onto their modern equivalents (see folder_paths.map_legacy).
+LEGACY_MODEL_FOLDER_ALIASES = {"unet": "diffusion_models", "clip": "text_encoders"}
+
+# Registered folder_paths keys that are not model destinations.
+_NON_MODEL_FOLDER_TYPES = {"custom_nodes", "user", "input", "output", "temp", "datasets", "configs"}
+
+
+def get_model_folder_types() -> list:
+    """Return canonical ComfyUI model folder type names (checkpoints, loras, vae, ...)."""
+    try:
+        import folder_paths
+    except ImportError:
+        folder_paths = None
+
+    names = []
+    if folder_paths and isinstance(getattr(folder_paths, "folder_names_and_paths", None), dict):
+        names = [k for k in folder_paths.folder_names_and_paths.keys() if k not in _NON_MODEL_FOLDER_TYPES]
+    if not names:
+        names = list(FALLBACK_MODEL_FOLDER_TYPES)
+    return names
+
+
+def suggest_model_folder(repo_path: str, folder_types: list = None) -> str:
+    """
+    Suggest a ComfyUI destination folder for a file inside a Hugging Face repo.
+
+    Scans the file's directory segments from shallowest to deepest and stops at the
+    first one naming a model folder type; deeper segments are kept as a sub-path.
+      split_files/diffusion_models/a.safetensors -> diffusion_models
+      loras/wan/x.safetensors                    -> loras/wan
+      a.safetensors                              -> "" (no suggestion)
+    """
+    if folder_types is None:
+        folder_types = get_model_folder_types()
+    canonical = {name.lower(): LEGACY_MODEL_FOLDER_ALIASES.get(name, name) for name in folder_types}
+    for legacy, modern in LEGACY_MODEL_FOLDER_ALIASES.items():
+        canonical.setdefault(legacy, modern)
+
+    dir_segments = str(repo_path or "").replace("\\", "/").strip("/").split("/")[:-1]
+    for idx, segment in enumerate(dir_segments):
+        match = canonical.get(segment.strip().lower())
+        if match:
+            return sanitize_rel_folder("/".join([match] + dir_segments[idx + 1:]))
+    return ""
+
+
 def get_model_subfolders(models_dir: str = None) -> list:
     try:
         import folder_paths
@@ -98,7 +149,7 @@ def get_model_subfolders(models_dir: str = None) -> list:
                 base_types.append(k)
     else:
         # Fallback list if folder_paths is not available
-        base_types = ["checkpoints", "clip", "diffusion_models", "vae", "loras", "controlnet", "upscale_models", "text_encoders", "style_models", "embeddings"]
+        base_types = list(FALLBACK_MODEL_FOLDER_TYPES)
 
     # Also include any actual top-level folders inside models_dir
     if os.path.exists(models_dir):

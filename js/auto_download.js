@@ -473,7 +473,8 @@ app.registerExtension({
                 });
         };
 
-        const createFolderPicker = (value, placeholder) => {
+        const createFolderPicker = (value, placeholder, options = {}) => {
+            const { autoFlip = false } = options;
             const wrapper = document.createElement("div");
             Object.assign(wrapper.style, {
                 position: "relative",
@@ -530,13 +531,41 @@ app.registerExtension({
                         e.preventDefault();
                         input.value = folder;
                         dropdown.style.display = "none";
+                        input.dispatchEvent(new Event("change", { bubbles: true }));
                     });
                     dropdown.appendChild(item);
                 });
             };
 
+            // Open upward when the picker sits near the bottom of a scrolling list
+            // (or the viewport), so the dropdown is not clipped.
+            const positionDropdown = () => {
+                const flipUp = (() => {
+                    if (!autoFlip) return false;
+                    const rect = wrapper.getBoundingClientRect();
+                    let bottomLimit = window.innerHeight;
+                    let topLimit = 0;
+                    for (let el = wrapper.parentElement; el && el !== document.body; el = el.parentElement) {
+                        const overflowY = getComputedStyle(el).overflowY;
+                        if (overflowY === "auto" || overflowY === "scroll") {
+                            const parentRect = el.getBoundingClientRect();
+                            bottomLimit = Math.min(bottomLimit, parentRect.bottom);
+                            topLimit = Math.max(topLimit, parentRect.top);
+                            break;
+                        }
+                    }
+                    const spaceBelow = bottomLimit - rect.bottom;
+                    const spaceAbove = rect.top - topLimit;
+                    return spaceBelow < 190 && spaceAbove > spaceBelow;
+                })();
+                Object.assign(dropdown.style, flipUp
+                    ? { top: "auto", bottom: "100%", borderTop: "1px solid var(--border-default)", borderBottom: "none", borderRadius: "8px 8px 0 0" }
+                    : { top: "100%", bottom: "auto", borderTop: "none", borderBottom: "1px solid var(--border-default)", borderRadius: "0 0 8px 8px" });
+            };
+
             const showList = () => {
                 buildList();
+                positionDropdown();
                 dropdown.style.display = "block";
             };
 
@@ -560,7 +589,7 @@ app.registerExtension({
             };
             folderPickers.add(picker);
 
-            return { wrapper, input };
+            return { wrapper, input, destroy: () => folderPickers.delete(picker) };
         };
 
         const parseFilenameFromUrl = (url) => {
@@ -3934,12 +3963,11 @@ app.registerExtension({
 
         const showManualDownloadDialog = () => {
 
-            let pollTimer = null;
+            // The repo browser can queue several batches from one dialog, each with its own poller.
+            const pollTimers = new Set();
             const stopPolling = () => {
-                if (pollTimer) {
-                    clearInterval(pollTimer);
-                    pollTimer = null;
-                }
+                pollTimers.forEach((timer) => clearInterval(timer));
+                pollTimers.clear();
             };
 
             const existing = document.getElementById("manual-download-dialog");
@@ -3951,6 +3979,8 @@ app.registerExtension({
 
             const closeDialog = () => {
                 stopPolling();
+                repoPickers.forEach((picker) => picker.destroy());
+                bulkPicker.destroy();
                 if (dlg.parentElement) {
                     dlg.remove();
                 }
@@ -4028,6 +4058,19 @@ app.registerExtension({
                 fontSize: "14px",
                 minHeight: "40px",
             });
+
+            const urlRow = document.createElement("div");
+            Object.assign(urlRow.style, {
+                display: "flex",
+                alignItems: "center",
+                gap: "8px",
+            });
+            const browseBtn = createButton("Browse", "p-button p-component p-button-secondary", null);
+            applyNativeButtonStyle(browseBtn, "secondary");
+            browseBtn.style.flexShrink = "0";
+            browseBtn.style.display = "none";
+            urlRow.appendChild(urlInput);
+            urlRow.appendChild(browseBtn);
 
             const fullRepoSwitchRow = document.createElement("div");
             Object.assign(fullRepoSwitchRow.style, {
@@ -4118,12 +4161,21 @@ app.registerExtension({
                 minHeight: "40px",
             });
 
+            const repoSection = document.createElement("div");
+            Object.assign(repoSection.style, {
+                display: "none",
+                flexDirection: "column",
+                gap: "8px",
+                marginTop: "4px",
+            });
+
             content.appendChild(urlLabel);
-            content.appendChild(urlInput);
+            content.appendChild(urlRow);
             content.appendChild(fullRepoSwitchRow);
             content.appendChild(destinationPreviewLine);
             content.appendChild(folderLabel);
             content.appendChild(folderPicker.wrapper);
+            content.appendChild(repoSection);
             panel.appendChild(content);
 
             const footer = document.createElement("div");
@@ -4147,6 +4199,712 @@ app.registerExtension({
                 statusLine.textContent = msg || "";
                 statusLine.style.color = color;
             };
+
+            /* ── Shared queue submission + status polling ── */
+            const TERMINAL_DOWNLOAD_STATUSES = new Set(["downloaded", "completed", "failed", "cancelled"]);
+
+            // POST models to /queue_download and poll their status until all reach a terminal state.
+            // hooks.onQueued(queued, rejected) runs before polling starts; hooks.onStatus(id, info) on
+            // every poll; hooks.onFinished(failures, total) once everything is done.
+            const submitQueue = async (models, hooks = {}) => {
+                const resp = await fetch("/queue_download", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ models })
+                });
+                if (resp.status !== 200) {
+                    throw new Error("Server returned " + resp.status + " " + resp.statusText);
+                }
+                const res = await resp.json();
+                const queued = res.queued || [];
+                const rejected = Array.isArray(res.rejected) ? res.rejected : [];
+                const downloadIds = queued.map((q) => q.download_id).filter(Boolean);
+                hooks.onQueued?.(queued, rejected);
+                if (!downloadIds.length) {
+                    return { queued, rejected };
+                }
+
+                const pending = new Set(downloadIds);
+                let statusErrorToastShown = false;
+                let finished = false;
+                let timer = null;
+
+                const poll = async () => {
+                    if (finished) return;
+                    try {
+                        const statusResp = await fetch(`/download_status?ids=${encodeURIComponent(downloadIds.join(","))}`);
+                        if (statusResp.status !== 200) return;
+                        const statusData = await statusResp.json();
+                        const downloads = statusData.downloads || {};
+                        statusErrorToastShown = false;
+                        if (finished) return;
+
+                        for (const id of downloadIds) {
+                            const info = downloads[id];
+                            if (!info) continue;
+                            hooks.onStatus?.(id, info);
+                            if (TERMINAL_DOWNLOAD_STATUSES.has(info.status)) {
+                                pending.delete(id);
+                            }
+                        }
+
+                        if (pending.size === 0) {
+                            finished = true;
+                            clearInterval(timer);
+                            pollTimers.delete(timer);
+                            const failures = downloadIds.filter((id) => downloads[id]?.status === "failed" || downloads[id]?.status === "cancelled").length;
+                            hooks.onFinished?.(failures, downloadIds.length);
+                        }
+                    } catch (e) {
+                        if (!statusErrorToastShown) {
+                            showToast({
+                                severity: "error",
+                                summary: "Status error",
+                                detail: "Status polling failed. Retrying in background."
+                            });
+                            statusErrorToastShown = true;
+                        }
+                        setStatus("Status polling error.", "#ff6b6b");
+                    }
+                };
+
+                timer = setInterval(poll, 1000);
+                pollTimers.add(timer);
+                poll();
+                return { queued, rejected };
+            };
+
+            /* ── Repo browser: list a repo's files and queue a selection ── */
+            const DIALOG_WIDTH_DEFAULT = "min(820px, 100%)";
+            const DIALOG_WIDTH_BROWSING = "min(1080px, 100%)";
+            const MISSING_DESTINATION_BORDER = "color-mix(in srgb, var(--destructive-background) 50%, var(--border-default) 50%)";
+            const MISSING_DESTINATION_BG = "color-mix(in srgb, var(--comfy-input-bg) 88%, var(--destructive-background) 12%)";
+            const REPO_ROW_STATUS_LABELS = {
+                queued: ["Queued", "#9ad6ff"],
+                downloading: ["Downloading", "#9ad6ff"],
+                copying: ["Downloading", "#9ad6ff"],
+                cleaning_cache: ["Finalizing", "#9ad6ff"],
+                finalizing: ["Finalizing", "#9ad6ff"],
+                verifying: ["Verifying", "#9ad6ff"],
+                downloaded: ["Done", "#5bd98c"],
+                completed: ["Done", "#5bd98c"],
+                failed: ["Failed", "#ff6b6b"],
+                cancelling: ["Cancelling", "#f5b14c"],
+                cancelled: ["Cancelled", "#f5b14c"],
+            };
+
+            let downloadBtnRef = null;
+            let repoListing = null; // /hf_repo_files response plus the link it was fetched for
+            let repoBrowseRequestId = 0;
+            let showAllRepoFiles = false;
+            const repoSelected = new Set();
+            const repoDestinations = new Map();
+            const repoRowStatus = new Map();
+            let repoRowRefs = new Map(); // path -> { input, badge } for the current render
+            let repoPickers = [];
+
+            // True for HF repo / tree links and owner/repo shorthand; false for single-file links.
+            const isRepoBrowseLink = (link) => {
+                const value = String(link || "").trim();
+                if (!value) return false;
+                let pathText = value;
+                if (value.includes("://")) {
+                    try {
+                        const parsed = new URL(value);
+                        if (String(parsed.hostname || "").toLowerCase() !== "huggingface.co") return false;
+                        pathText = parsed.pathname || "";
+                    } catch {
+                        return false;
+                    }
+                }
+                const parts = String(pathText).split("?")[0].split("#")[0].split("/").filter(Boolean);
+                if (parts.length < 2) return false;
+                if (parts.includes("resolve") || parts.includes("blob")) return false;
+                if (parts.length > 2 && !parts.includes("tree") && parts[parts.length - 1].includes(".")) return false;
+                return true;
+            };
+
+            const formatRepoFileSize = (value) => {
+                if (value === null || value === undefined) return "";
+                const units = ["B", "KB", "MB", "GB", "TB"];
+                let size = Number(value) || 0;
+                let unitIndex = 0;
+                while (size >= 1024 && unitIndex < units.length - 1) {
+                    size /= 1024;
+                    unitIndex += 1;
+                }
+                const decimals = size >= 10 || unitIndex === 0 ? 0 : 1;
+                return `${size.toFixed(decimals)} ${units[unitIndex]}`;
+            };
+
+            const buildRepoFileUrl = (file) => {
+                const encodedPath = String(file.path).split("/").map(encodeURIComponent).join("/");
+                return `https://huggingface.co/${repoListing.repo}/resolve/${encodeURIComponent(repoListing.revision || "main")}/${encodedPath}`;
+            };
+
+            const visibleRepoFiles = () => (repoListing?.files || []).filter((f) => showAllRepoFiles || f.is_model);
+            const repoDestinationFor = (file) => normalizeFolderPathInput(repoDestinations.get(file.path) || "");
+
+            const styleDestinationInput = (input) => {
+                const missing = !normalizeFolderPathInput(input.value);
+                input.style.borderColor = missing ? MISSING_DESTINATION_BORDER : "var(--border-default)";
+                input.style.background = missing ? MISSING_DESTINATION_BG : "var(--comfy-input-bg)";
+            };
+
+            const createSmallSwitch = (labelText, onChange) => {
+                const row = document.createElement("label");
+                Object.assign(row.style, {
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "8px",
+                    cursor: "pointer",
+                    fontSize: "13px",
+                    color: "var(--input-text)",
+                    userSelect: "none",
+                });
+                const wrap = document.createElement("span");
+                wrap.className = "hf-manual-toggle p-toggleswitch p-component";
+                const input = document.createElement("input");
+                input.type = "checkbox";
+                input.className = "p-toggleswitch-input";
+                input.setAttribute("role", "switch");
+                input.setAttribute("aria-label", labelText);
+                const slider = document.createElement("span");
+                slider.className = "p-toggleswitch-slider";
+                wrap.appendChild(input);
+                wrap.appendChild(slider);
+                const text = document.createElement("span");
+                text.textContent = labelText;
+                row.appendChild(wrap);
+                row.appendChild(text);
+                const syncVisual = () => {
+                    wrap.classList.toggle("p-toggleswitch-checked", input.checked);
+                    input.setAttribute("aria-checked", input.checked ? "true" : "false");
+                };
+                input.addEventListener("change", () => {
+                    syncVisual();
+                    onChange(input.checked);
+                });
+                return {
+                    element: row,
+                    set: (checked) => {
+                        input.checked = Boolean(checked);
+                        syncVisual();
+                    },
+                };
+            };
+
+            const createLinkButton = (text, onClick) => {
+                const btn = document.createElement("button");
+                btn.type = "button";
+                btn.textContent = text;
+                Object.assign(btn.style, {
+                    background: "none",
+                    border: "none",
+                    padding: "0",
+                    color: "var(--p-primary-color, #6aa9ff)",
+                    fontSize: "13px",
+                    cursor: "pointer",
+                });
+                btn.addEventListener("click", onClick);
+                return btn;
+            };
+
+            const repoHeader = document.createElement("div");
+            Object.assign(repoHeader.style, {
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                flexWrap: "wrap",
+                gap: "8px 16px",
+            });
+            const repoTitle = document.createElement("div");
+            Object.assign(repoTitle.style, {
+                fontSize: "14px",
+                fontWeight: "600",
+                color: "var(--input-text)",
+                minWidth: "0",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+            });
+            const repoHeaderControls = document.createElement("div");
+            Object.assign(repoHeaderControls.style, {
+                display: "flex",
+                alignItems: "center",
+                gap: "14px",
+            });
+            const showAllSwitch = createSmallSwitch("Show all files", (checked) => {
+                showAllRepoFiles = checked;
+                if (!checked) {
+                    // Don't queue files the user can no longer see.
+                    for (const f of repoListing?.files || []) {
+                        if (!f.is_model) repoSelected.delete(f.path);
+                    }
+                }
+                renderRepoList();
+            });
+            const selectAllBtn = createLinkButton("Select all", () => {
+                visibleRepoFiles().forEach((f) => repoSelected.add(f.path));
+                renderRepoList();
+            });
+            const selectNoneBtn = createLinkButton("Select none", () => {
+                repoSelected.clear();
+                renderRepoList();
+            });
+            repoHeaderControls.appendChild(showAllSwitch.element);
+            repoHeaderControls.appendChild(selectAllBtn);
+            repoHeaderControls.appendChild(selectNoneBtn);
+            repoHeader.appendChild(repoTitle);
+            repoHeader.appendChild(repoHeaderControls);
+
+            const repoNotice = document.createElement("div");
+            Object.assign(repoNotice.style, {
+                display: "none",
+                fontSize: "13px",
+                lineHeight: "1.4",
+                color: "#f5b14c",
+            });
+
+            const bulkRow = document.createElement("div");
+            Object.assign(bulkRow.style, {
+                display: "flex",
+                alignItems: "center",
+                gap: "8px",
+            });
+            const bulkLabel = document.createElement("span");
+            bulkLabel.textContent = "Set destination for selected:";
+            Object.assign(bulkLabel.style, {
+                fontSize: "13px",
+                color: "var(--descrip-text, #9aa1ad)",
+                whiteSpace: "nowrap",
+            });
+            const bulkPicker = createFolderPicker("", "Folder");
+            Object.assign(bulkPicker.wrapper.style, { flex: "1", minWidth: "0" });
+            Object.assign(bulkPicker.input.style, { minHeight: "34px", padding: "4px 10px", fontSize: "13px" });
+            // createInput only tints URL placeholders; keep the bulk picker neutral.
+            bulkPicker.input.style.borderColor = "var(--border-default)";
+            bulkPicker.input.style.background = "var(--comfy-input-bg)";
+            const bulkApplyBtn = createButton("Apply", "p-button p-component p-button-secondary", () => {
+                const dest = normalizeFolderPathInput(bulkPicker.input.value);
+                if (!dest) {
+                    showToast({ severity: "warn", summary: "No folder", detail: "Choose a destination folder first." });
+                    return;
+                }
+                const selectedVisible = visibleRepoFiles().filter((f) => repoSelected.has(f.path));
+                if (!selectedVisible.length) {
+                    showToast({ severity: "warn", summary: "Nothing selected", detail: "Select the files to apply this folder to." });
+                    return;
+                }
+                selectedVisible.forEach((f) => repoDestinations.set(f.path, dest));
+                renderRepoList();
+            });
+            applyNativeButtonStyle(bulkApplyBtn, "secondary");
+            Object.assign(bulkApplyBtn.style, { minHeight: "34px", flexShrink: "0" });
+            bulkRow.appendChild(bulkLabel);
+            bulkRow.appendChild(bulkPicker.wrapper);
+            bulkRow.appendChild(bulkApplyBtn);
+
+            const repoList = document.createElement("div");
+            Object.assign(repoList.style, {
+                maxHeight: "min(50vh, 480px)",
+                overflowY: "auto",
+                border: "1px solid var(--border-default)",
+                borderRadius: "8px",
+                padding: "4px 0",
+            });
+            applyNativeScrollbarClasses(repoList);
+
+            const repoSummary = document.createElement("div");
+            Object.assign(repoSummary.style, {
+                fontSize: "13px",
+                color: "var(--descrip-text, #9aa1ad)",
+            });
+
+            repoSection.appendChild(repoHeader);
+            repoSection.appendChild(repoNotice);
+            repoSection.appendChild(bulkRow);
+            repoSection.appendChild(repoList);
+            repoSection.appendChild(repoSummary);
+
+            const REPO_ROW_GRID = "20px minmax(0, 1fr) auto 72px minmax(160px, 260px)";
+
+            const updateRepoRowBadge = (file) => {
+                const refs = repoRowRefs.get(file.path);
+                if (!refs) return;
+                const status = repoRowStatus.get(file.path);
+                const [label, color] = REPO_ROW_STATUS_LABELS[status] || [];
+                if (label) {
+                    refs.badge.textContent = label;
+                    refs.badge.style.color = color;
+                    refs.badge.style.display = "";
+                } else if (file.exists && repoDestinationFor(file) === normalizeFolderPathInput(file.suggested_folder)) {
+                    refs.badge.textContent = "Installed";
+                    refs.badge.style.color = "#5bd98c";
+                    refs.badge.style.display = "";
+                } else {
+                    refs.badge.style.display = "none";
+                }
+            };
+
+            const updateRepoSelectionUi = () => {
+                const visible = visibleRepoFiles();
+                const selected = visible.filter((f) => repoSelected.has(f.path));
+                const totalBytes = selected.reduce((sum, f) => sum + (Number(f.size) || 0), 0);
+                const missing = selected.filter((f) => !repoDestinationFor(f)).length;
+                let summary = `${selected.length} of ${visible.length} selected`;
+                if (selected.length) summary += ` · ${formatRepoFileSize(totalBytes)}`;
+                if (missing) summary += ` · ${missing} need a destination folder`;
+                repoSummary.textContent = summary;
+                repoSummary.style.color = missing ? "#f5b14c" : "var(--descrip-text, #9aa1ad)";
+                if (downloadBtnRef) {
+                    downloadBtnRef.textContent = selected.length ? `Download ${selected.length} selected` : "Download";
+                    downloadBtnRef.disabled = !selected.length;
+                    downloadBtnRef.style.opacity = selected.length ? "1" : "0.5";
+                }
+            };
+
+            const renderRepoList = () => {
+                repoPickers.forEach((picker) => picker.destroy());
+                repoPickers = [];
+                repoRowRefs = new Map();
+                repoList.innerHTML = "";
+
+                const files = visibleRepoFiles();
+                const allCount = repoListing?.files?.length || 0;
+                const modelCount = (repoListing?.files || []).filter((f) => f.is_model).length;
+                repoTitle.textContent = `${repoListing.repo}${repoListing.subfolder ? `/${repoListing.subfolder}` : ""} · ${modelCount} model file${modelCount === 1 ? "" : "s"}${allCount !== modelCount ? ` (${allCount} total)` : ""}`;
+                repoTitle.title = repoTitle.textContent;
+
+                if (!files.length) {
+                    const empty = document.createElement("div");
+                    empty.textContent = allCount
+                        ? "No model weight files found. Turn on “Show all files” to see everything in this repo."
+                        : "This repo has no files.";
+                    Object.assign(empty.style, { padding: "14px 12px", fontSize: "13px", color: "var(--descrip-text, #9aa1ad)" });
+                    repoList.appendChild(empty);
+                    updateRepoSelectionUi();
+                    return;
+                }
+
+                const groups = new Map();
+                for (const f of files) {
+                    if (!groups.has(f.dir)) groups.set(f.dir, []);
+                    groups.get(f.dir).push(f);
+                }
+
+                for (const [dir, groupFiles] of groups) {
+                    const groupHeader = document.createElement("label");
+                    Object.assign(groupHeader.style, {
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "10px",
+                        padding: "8px 12px 4px",
+                        fontSize: "12px",
+                        fontWeight: "600",
+                        letterSpacing: "0.03em",
+                        color: "var(--descrip-text, #9aa1ad)",
+                        cursor: "pointer",
+                        userSelect: "none",
+                    });
+                    const groupCheckbox = document.createElement("input");
+                    groupCheckbox.type = "checkbox";
+                    groupCheckbox.style.margin = "0";
+                    const groupText = document.createElement("span");
+                    groupText.textContent = `${dir || "(repo root)"}  ·  ${groupFiles.length}`;
+                    groupHeader.appendChild(groupCheckbox);
+                    groupHeader.appendChild(groupText);
+                    const groupSuggested = normalizeFolderPathInput(groupFiles[0].suggested_folder);
+                    const groupHint = document.createElement("span");
+                    Object.assign(groupHint.style, { fontWeight: "500", letterSpacing: "0" });
+                    if (groupFiles.every((f) => normalizeFolderPathInput(f.suggested_folder) === groupSuggested) && groupSuggested) {
+                        groupHint.textContent = `→ models/${groupSuggested}`;
+                        groupHint.style.color = "#5bd98c";
+                    } else if (!groupSuggested) {
+                        groupHint.textContent = "choose a destination";
+                        groupHint.style.color = "#f5b14c";
+                    }
+                    groupHeader.appendChild(groupHint);
+                    repoList.appendChild(groupHeader);
+
+                    const rowCheckboxes = [];
+                    const syncGroupCheckbox = () => {
+                        const n = groupFiles.filter((f) => repoSelected.has(f.path)).length;
+                        groupCheckbox.checked = n === groupFiles.length;
+                        groupCheckbox.indeterminate = n > 0 && n < groupFiles.length;
+                    };
+                    groupCheckbox.addEventListener("change", () => {
+                        const check = groupCheckbox.checked;
+                        groupFiles.forEach((f, i) => {
+                            if (check) repoSelected.add(f.path);
+                            else repoSelected.delete(f.path);
+                            rowCheckboxes[i].checked = check;
+                        });
+                        syncGroupCheckbox();
+                        updateRepoSelectionUi();
+                    });
+
+                    for (const file of groupFiles) {
+                        const row = document.createElement("div");
+                        Object.assign(row.style, {
+                            display: "grid",
+                            gridTemplateColumns: REPO_ROW_GRID,
+                            alignItems: "center",
+                            gap: "10px",
+                            padding: "3px 12px 3px 32px",
+                            cursor: "pointer",
+                        });
+                        row.addEventListener("mouseenter", () => {
+                            row.style.background = "var(--secondary-background-hover)";
+                        });
+                        row.addEventListener("mouseleave", () => {
+                            row.style.background = "transparent";
+                        });
+
+                        const checkbox = document.createElement("input");
+                        checkbox.type = "checkbox";
+                        checkbox.checked = repoSelected.has(file.path);
+                        checkbox.style.margin = "0";
+                        checkbox.addEventListener("change", () => {
+                            if (checkbox.checked) repoSelected.add(file.path);
+                            else repoSelected.delete(file.path);
+                            syncGroupCheckbox();
+                            updateRepoSelectionUi();
+                        });
+                        rowCheckboxes.push(checkbox);
+
+                        const nameEl = document.createElement("div");
+                        nameEl.textContent = file.name;
+                        nameEl.title = file.path;
+                        Object.assign(nameEl.style, {
+                            fontSize: "13px",
+                            color: file.is_model ? "var(--input-text)" : "var(--descrip-text, #9aa1ad)",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                        });
+
+                        const badge = document.createElement("span");
+                        Object.assign(badge.style, {
+                            fontSize: "11px",
+                            fontWeight: "600",
+                            whiteSpace: "nowrap",
+                            display: "none",
+                        });
+
+                        const sizeEl = document.createElement("div");
+                        sizeEl.textContent = formatRepoFileSize(file.size);
+                        Object.assign(sizeEl.style, {
+                            fontSize: "12px",
+                            color: "var(--descrip-text, #9aa1ad)",
+                            textAlign: "right",
+                            fontVariantNumeric: "tabular-nums",
+                        });
+
+                        const picker = createFolderPicker(repoDestinations.get(file.path) || "", "Choose folder…", { autoFlip: true });
+                        repoPickers.push(picker);
+                        Object.assign(picker.input.style, { minHeight: "30px", padding: "3px 10px", fontSize: "13px" });
+                        styleDestinationInput(picker.input);
+                        const onDestinationChange = () => {
+                            repoDestinations.set(file.path, picker.input.value);
+                            styleDestinationInput(picker.input);
+                            updateRepoRowBadge(file);
+                            updateRepoSelectionUi();
+                        };
+                        picker.input.addEventListener("input", onDestinationChange);
+                        picker.input.addEventListener("change", onDestinationChange);
+
+                        row.addEventListener("click", (event) => {
+                            if (event.target === checkbox || picker.wrapper.contains(event.target)) return;
+                            checkbox.checked = !checkbox.checked;
+                            checkbox.dispatchEvent(new Event("change"));
+                        });
+
+                        row.appendChild(checkbox);
+                        row.appendChild(nameEl);
+                        row.appendChild(badge);
+                        row.appendChild(sizeEl);
+                        row.appendChild(picker.wrapper);
+                        repoList.appendChild(row);
+
+                        repoRowRefs.set(file.path, { input: picker.input, badge });
+                        updateRepoRowBadge(file);
+                    }
+                    syncGroupCheckbox();
+                }
+                updateRepoSelectionUi();
+            };
+
+            const setRepoBrowsingLayout = (browsing) => {
+                repoSection.style.display = browsing ? "flex" : "none";
+                folderLabel.style.display = browsing ? "none" : "";
+                folderPicker.wrapper.style.display = browsing ? "none" : "";
+                panel.style.width = browsing ? DIALOG_WIDTH_BROWSING : DIALOG_WIDTH_DEFAULT;
+            };
+
+            const resetBrowseButton = () => {
+                browseBtn.disabled = false;
+                browseBtn.textContent = "Browse";
+            };
+
+            const clearRepoListing = () => {
+                repoBrowseRequestId += 1;
+                repoListing = null;
+                repoSelected.clear();
+                repoDestinations.clear();
+                repoRowStatus.clear();
+                repoPickers.forEach((picker) => picker.destroy());
+                repoPickers = [];
+                repoRowRefs = new Map();
+                repoList.innerHTML = "";
+                setRepoBrowsingLayout(false);
+                resetBrowseButton();
+                if (downloadBtnRef) {
+                    downloadBtnRef.textContent = "Download";
+                    downloadBtnRef.disabled = false;
+                    downloadBtnRef.style.opacity = "1";
+                }
+            };
+
+            const browseRepo = async () => {
+                const link = urlInput.value.trim();
+                if (fullRepoSwitch.checked || !isRepoBrowseLink(link)) return;
+                const requestId = ++repoBrowseRequestId;
+                browseBtn.disabled = true;
+                browseBtn.textContent = "Loading…";
+                setStatus("Fetching repository file list...", "#9ad6ff");
+                try {
+                    const resp = await fetch(`/hf_repo_files?link=${encodeURIComponent(link)}`);
+                    const data = await resp.json().catch(() => ({}));
+                    if (requestId !== repoBrowseRequestId) return;
+                    if (!resp.ok || data.error) {
+                        throw new Error(data.error || `Server returned ${resp.status}`);
+                    }
+                    const files = Array.isArray(data.files) ? data.files : [];
+                    repoListing = { ...data, files, link };
+                    repoSelected.clear();
+                    repoDestinations.clear();
+                    repoRowStatus.clear();
+                    files.forEach((f) => repoDestinations.set(f.path, f.suggested_folder || ""));
+                    showAllRepoFiles = files.length > 0 && !files.some((f) => f.is_model);
+                    showAllSwitch.set(showAllRepoFiles);
+                    if (data.is_diffusers) {
+                        repoNotice.textContent = "This looks like a diffusers-format repo (model_index.json). Its component folders are usually not loadable by ComfyUI's standard loaders, so no destinations were suggested.";
+                        repoNotice.style.display = "block";
+                    } else {
+                        repoNotice.style.display = "none";
+                    }
+                    setRepoBrowsingLayout(true);
+                    destinationPreviewLine.style.display = "none";
+                    renderRepoList();
+                    setStatus("");
+                } catch (e) {
+                    if (requestId !== repoBrowseRequestId) return;
+                    setStatus(`Could not list repo: ${e?.message || e}`, "#ff6b6b");
+                } finally {
+                    if (requestId === repoBrowseRequestId) resetBrowseButton();
+                }
+            };
+
+            const queueRepoSelection = async () => {
+                const files = visibleRepoFiles().filter((f) => repoSelected.has(f.path));
+                if (!files.length) {
+                    showToast({ severity: "warn", summary: "Nothing selected", detail: "Select the files you want to download." });
+                    return;
+                }
+                const missing = files.find((f) => !repoDestinationFor(f));
+                if (missing) {
+                    const refs = repoRowRefs.get(missing.path);
+                    showToast({
+                        severity: "warn",
+                        summary: "Destination required",
+                        detail: `Choose a destination folder for ${missing.name}.`
+                    });
+                    if (refs?.input) {
+                        refs.input.scrollIntoView({ block: "nearest" });
+                        refs.input.focus();
+                    }
+                    return;
+                }
+
+                const models = files.map((f) => ({
+                    url: buildRepoFileUrl(f),
+                    filename: f.name,
+                    target_filename: f.name,
+                    folder: repoDestinationFor(f),
+                    display_name: f.name,
+                }));
+                const idToFile = new Map();
+                const listingAtSubmit = repoListing;
+                downloadBtnRef.disabled = true;
+                setStatus(`Queuing ${models.length} download(s)...`, "#9ad6ff");
+
+                const isCurrentListing = () => repoListing === listingAtSubmit;
+                try {
+                    const { queued, rejected } = await submitQueue(models, {
+                        onQueued: (queuedItems, rejectedItems) => {
+                            // queue_download preserves order; fall back to filename matching if anything was rejected.
+                            const aligned = !rejectedItems.length && queuedItems.length === files.length;
+                            queuedItems.forEach((q, i) => {
+                                const file = aligned ? files[i] : files.find((f) => f.name === q.filename);
+                                if (q?.download_id && file) idToFile.set(q.download_id, file);
+                            });
+                        },
+                        onStatus: (id, info) => {
+                            const file = idToFile.get(id);
+                            if (!file || !isCurrentListing()) return;
+                            if (repoRowStatus.get(file.path) !== info.status) {
+                                repoRowStatus.set(file.path, info.status);
+                                updateRepoRowBadge(file);
+                            }
+                        },
+                        onFinished: (failures, total) => {
+                            if (failures) {
+                                setStatus(`${total - failures} of ${total} download(s) finished; ${failures} failed or cancelled.`, "#ff6b6b");
+                            } else {
+                                setStatus(`${total} download(s) completed.`, "#5bd98c");
+                            }
+                        },
+                    });
+
+                    if (rejected.length) {
+                        const detail = rejected.map((r) => `${r.filename || "file"}: ${r.error || "rejected"}`).join("\n");
+                        showToast({ severity: "warn", summary: `${rejected.length} rejected`, detail });
+                    }
+                    if (isCurrentListing()) {
+                        for (const file of idToFile.values()) {
+                            repoSelected.delete(file.path);
+                            repoRowStatus.set(file.path, "queued");
+                        }
+                        renderRepoList();
+                    }
+                    if (queued.length) {
+                        setStatus(`Queued ${queued.length} download(s). Track progress in the Downloads panel.`, "#9ad6ff");
+                    } else {
+                        setStatus("No downloads were queued.", "#f5b14c");
+                    }
+                } catch (e) {
+                    showToast({ severity: "error", summary: "Queue error", detail: String(e) });
+                    setStatus(`Queue error: ${String(e)}`, "#ff6b6b");
+                } finally {
+                    if (isCurrentListing()) updateRepoSelectionUi();
+                }
+            };
+
+            browseBtn.addEventListener("click", () => browseRepo());
+            urlInput.addEventListener("keydown", (event) => {
+                if (event.key === "Enter" && !fullRepoSwitch.checked && isRepoBrowseLink(urlInput.value)) {
+                    event.preventDefault();
+                    browseRepo();
+                }
+            });
+            urlInput.addEventListener("paste", () => {
+                setTimeout(() => {
+                    if (!fullRepoSwitch.checked && isRepoBrowseLink(urlInput.value)) {
+                        browseRepo();
+                    }
+                }, 0);
+            });
 
             let folderValueForNormalMode = "loras";
             let folderValueForRepoMode = "";
@@ -4173,6 +4931,13 @@ app.registerExtension({
                     folderValueForNormalMode = currentFolderValue || "loras";
                 }
 
+                const urlValue = urlInput.value.trim();
+                if (repoListing && (fullRepoMode || urlValue !== repoListing.link)) {
+                    clearRepoListing();
+                }
+                const canBrowseRepo = !fullRepoMode && isRepoBrowseLink(urlValue);
+                browseBtn.style.display = canBrowseRepo ? "" : "none";
+
                 if (fullRepoMode) {
                     urlLabel.textContent = "Hugging Face URL / Repo / Folder";
                     urlInput.placeholder = "https://huggingface.co/owner/repo[/tree/main/subfolder]";
@@ -4191,11 +4956,16 @@ app.registerExtension({
                     return;
                 }
 
-                urlLabel.textContent = "Model URL";
-                urlInput.placeholder = "https://example.com/path/model.safetensors";
+                urlLabel.textContent = "Model URL or Hugging Face repo";
+                urlInput.placeholder = "https://huggingface.co/owner/repo  ·  owner/repo  ·  https://example.com/model.safetensors";
                 folderLabel.textContent = "Folder";
                 folderPicker.input.placeholder = "Folder";
-                destinationPreviewLine.style.display = "none";
+                if (canBrowseRepo && !repoListing) {
+                    destinationPreviewLine.textContent = "Repo link detected. Press Browse (or Enter) to pick files from it.";
+                    destinationPreviewLine.style.display = "block";
+                } else {
+                    destinationPreviewLine.style.display = "none";
+                }
             };
 
             fullRepoSwitch.addEventListener("change", () => {
@@ -4204,6 +4974,7 @@ app.registerExtension({
             });
             urlInput.addEventListener("input", () => updateManualDownloadModeUi("input"));
             folderPicker.input.addEventListener("input", () => updateManualDownloadModeUi("input"));
+            folderPicker.input.addEventListener("change", () => updateManualDownloadModeUi("input"));
             setFullRepoSwitchVisualState();
             updateManualDownloadModeUi();
 
@@ -4220,8 +4991,17 @@ app.registerExtension({
                         summary: "Missing URL",
                         detail: fullRepoMode
                             ? "Enter a Hugging Face repo or folder link."
-                            : "Enter a direct model file URL."
+                            : "Enter a model file URL or a Hugging Face repo."
                     });
+                    return;
+                }
+
+                if (!fullRepoMode && repoListing) {
+                    await queueRepoSelection();
+                    return;
+                }
+                if (!fullRepoMode && isRepoBrowseLink(url)) {
+                    await browseRepo();
                     return;
                 }
 
@@ -4259,21 +5039,19 @@ app.registerExtension({
                 );
 
                 try {
-                    const resp = await fetch("/queue_download", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                            models: [queueModel]
-                        })
+                    const { queued, rejected } = await submitQueue([queueModel], {
+                        onFinished: (failures) => {
+                            downloadBtn.disabled = false;
+                            downloadBtn.textContent = "Download";
+                            if (failures) {
+                                setStatus(`Finished with ${failures} error(s).`, "#ff6b6b");
+                            } else {
+                                setStatus("Download completed.", "#5bd98c");
+                            }
+                        },
                     });
-                    if (resp.status !== 200) {
-                        throw new Error("Server returned " + resp.status + " " + resp.statusText);
-                    }
-                    const res = await resp.json();
-                    const queued = res.queued || [];
-                    const rejected = Array.isArray(res.rejected) ? res.rejected : [];
-                    const downloadIds = queued.map(q => q.download_id);
-                    if (!downloadIds.length) {
+                    const queuedCount = queued.filter((q) => q?.download_id).length;
+                    if (!queuedCount) {
                         const rejection = rejected.length ? String(rejected[0]?.error || "").trim() : "";
                         const detail = rejection || "No download was queued.";
                         showToast({ severity: "warn", summary: "Queue rejected", detail });
@@ -4283,57 +5061,7 @@ app.registerExtension({
                         return;
                     }
 
-                    setStatus(`Queued ${downloadIds.length} download(s). Track progress in the Downloads panel.`, "#9ad6ff");
-                    const statusMap = {};
-                    const pending = new Set(downloadIds);
-                    let statusErrorToastShown = false;
-
-                    const poll = async () => {
-                        try {
-                            const statusResp = await fetch(`/download_status?ids=${encodeURIComponent(downloadIds.join(","))}`);
-                            if (statusResp.status !== 200) return;
-                            const statusData = await statusResp.json();
-                            const downloads = statusData.downloads || {};
-                            statusErrorToastShown = false;
-
-                            for (const id of downloadIds) {
-                                const info = downloads[id];
-                                if (!info) continue;
-                                const last = statusMap[id];
-                                if (last !== info.status) {
-                                    statusMap[id] = info.status;
-                                }
-                                if (info.status === "downloaded" || info.status === "completed" || info.status === "failed" || info.status === "cancelled") {
-                                    pending.delete(id);
-                                }
-                            }
-
-                            if (pending.size === 0) {
-                                stopPolling();
-                                const failures = downloadIds.filter((id) => downloads[id]?.status === "failed" || downloads[id]?.status === "cancelled").length;
-                                downloadBtn.disabled = false;
-                                downloadBtn.textContent = "Download";
-                                if (failures) {
-                                    setStatus(`Finished with ${failures} error(s).`, "#ff6b6b");
-                                } else {
-                                    setStatus("Download completed.", "#5bd98c");
-                                }
-                            }
-                        } catch (e) {
-                            if (!statusErrorToastShown) {
-                                showToast({
-                                    severity: "error",
-                                    summary: "Status error",
-                                    detail: "Status polling failed. Retrying in background."
-                                });
-                                statusErrorToastShown = true;
-                            }
-                            setStatus("Status polling error.", "#ff6b6b");
-                        }
-                    };
-
-                    pollTimer = setInterval(poll, 1000);
-                    poll();
+                    setStatus(`Queued ${queuedCount} download(s). Track progress in the Downloads panel.`, "#9ad6ff");
                 } catch (e) {
                     showToast({ severity: "error", summary: "Queue error", detail: String(e) });
                     downloadBtn.disabled = false;
@@ -4342,6 +5070,7 @@ app.registerExtension({
                 }
             });
             applyNativeButtonStyle(downloadBtn, "primary");
+            downloadBtnRef = downloadBtn;
 
             footer.appendChild(downloadBtn);
             panel.appendChild(footer);
