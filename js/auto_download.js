@@ -455,6 +455,36 @@ app.registerExtension({
             "clip_vision"
         ];
         const folderPickers = new Set();
+        const FOLDER_DROPDOWN_MAX_HEIGHT = 240;
+
+        const normalizeFolderQuery = (value) =>
+            String(value || "")
+                .replace(/\\/g, "/")
+                .trim()
+                .replace(/^\/+/, "")
+                .replace(/\/+$/, "")
+                .toLowerCase();
+
+        // Filter folders by every whitespace-separated term, ranking exact, prefix and
+        // segment-start matches ahead of plain substring matches (original order breaks ties).
+        const rankFolderMatches = (folders, typedQuery) => {
+            const q = normalizeFolderQuery(typedQuery);
+            const terms = q.split(/\s+/).filter(Boolean);
+            if (!terms.length) return [...folders];
+            const scored = [];
+            folders.forEach((folder, index) => {
+                const lower = folder.toLowerCase();
+                if (!terms.every((term) => lower.includes(term))) return;
+                let score = 4;
+                if (lower === q) score = 0;
+                else if (lower.startsWith(q)) score = 1;
+                else if (new RegExp(`(^|[/_\\-.])${q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`).test(lower)) score = 2;
+                else if (lower.includes(q)) score = 3;
+                scored.push({ folder, score, index });
+            });
+            scored.sort((a, b) => a.score - b.score || a.index - b.index);
+            return scored.map((s) => s.folder);
+        };
 
         const loadFolderList = () => {
             fetch("/folder_structure")
@@ -493,7 +523,7 @@ app.registerExtension({
                 background: "var(--comfy-menu-bg)",
                 border: "1px solid var(--border-default)",
                 borderTop: "none",
-                maxHeight: "180px",
+                maxHeight: `${FOLDER_DROPDOWN_MAX_HEIGHT}px`,
                 overflowY: "auto",
                 zIndex: 10,
                 display: "none",
@@ -501,40 +531,113 @@ app.registerExtension({
             });
             applyNativeScrollbarClasses(dropdown);
 
+            // query is null right after focus (show every folder, current one highlighted)
+            // and becomes the typed text once the user starts typing.
+            let query = null;
+            let valueAtFocus = input.value;
+            let listOptions = [];
+            let activeIndex = -1;
+
+            const isOpen = () => dropdown.style.display === "block";
+
+            const close = () => {
+                dropdown.style.display = "none";
+                query = null;
+            };
+
+            const choose = (folder) => {
+                input.value = folder;
+                close();
+                input.dispatchEvent(new Event("change", { bubbles: true }));
+            };
+
+            const setActive = (index, scroll = true) => {
+                const items = dropdown.querySelectorAll("[data-folder-option]");
+                items.forEach((el, i) => {
+                    el.style.background = i === index ? "var(--secondary-background-hover)" : "transparent";
+                });
+                activeIndex = index;
+                const activeItem = items[index];
+                if (scroll && activeItem) {
+                    // Scroll only the dropdown; scrollIntoView would also scroll any outer list.
+                    if (activeItem.offsetTop < dropdown.scrollTop) {
+                        dropdown.scrollTop = activeItem.offsetTop;
+                    } else if (activeItem.offsetTop + activeItem.offsetHeight > dropdown.scrollTop + dropdown.clientHeight) {
+                        dropdown.scrollTop = activeItem.offsetTop + activeItem.offsetHeight - dropdown.clientHeight;
+                    }
+                }
+            };
+
+            const appendHighlighted = (el, text, term) => {
+                const idx = term ? text.toLowerCase().indexOf(term) : -1;
+                if (idx < 0) {
+                    el.textContent = text;
+                    return;
+                }
+                el.appendChild(document.createTextNode(text.slice(0, idx)));
+                const mark = document.createElement("span");
+                mark.textContent = text.slice(idx, idx + term.length);
+                Object.assign(mark.style, { fontWeight: "700", color: "var(--p-primary-color, #6aa9ff)" });
+                el.appendChild(mark);
+                el.appendChild(document.createTextNode(text.slice(idx + term.length)));
+            };
+
             const buildList = () => {
                 dropdown.innerHTML = "";
-                if (!availableFolders.length) {
+                const typed = query === null ? "" : normalizeFolderQuery(query);
+                const matches = typed ? rankFolderMatches(availableFolders, typed) : [...availableFolders];
+                const exactExists = availableFolders.some((f) => f.toLowerCase() === typed);
+                listOptions = matches.map((folder) => ({ folder, label: folder }));
+                if (typed && !exactExists) {
+                    const newFolder = String(query).replace(/\\/g, "/").trim().replace(/^\/+|\/+$/g, "");
+                    listOptions.push({ folder: newFolder, label: `Create new folder “${newFolder}”`, isNew: true });
+                }
+
+                if (!listOptions.length) {
                     const empty = document.createElement("div");
                     empty.textContent = "No folders available";
                     empty.style.padding = "6px 8px";
                     empty.style.color = "#888";
                     dropdown.appendChild(empty);
+                    activeIndex = -1;
                     return;
                 }
-                availableFolders.forEach(folder => {
+
+                const highlightTerm = typed.split(/\s+/).filter(Boolean)[0] || "";
+                listOptions.forEach((option, index) => {
                     const item = document.createElement("div");
-                    item.textContent = folder;
+                    item.dataset.folderOption = "";
                     Object.assign(item.style, {
                         padding: "7px 10px",
                         cursor: "pointer",
-                        color: "var(--input-text)",
+                        color: option.isNew ? "#f5b14c" : "var(--input-text)",
                         fontSize: "13px",
                         fontFamily: "var(--font-inter, Inter, sans-serif)",
+                        whiteSpace: "nowrap",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        borderTop: option.isNew && index > 0 ? "1px solid var(--border-default)" : "none",
                     });
-                    item.addEventListener("mouseenter", () => {
-                        item.style.background = "var(--secondary-background-hover)";
-                    });
-                    item.addEventListener("mouseleave", () => {
-                        item.style.background = "transparent";
-                    });
+                    if (option.isNew) {
+                        item.textContent = option.label;
+                    } else {
+                        appendHighlighted(item, option.label, highlightTerm);
+                    }
+                    item.title = option.folder;
+                    item.addEventListener("mouseenter", () => setActive(index, false));
                     item.addEventListener("mousedown", (e) => {
                         e.preventDefault();
-                        input.value = folder;
-                        dropdown.style.display = "none";
-                        input.dispatchEvent(new Event("change", { bubbles: true }));
+                        choose(option.folder);
                     });
                     dropdown.appendChild(item);
                 });
+
+                // Typing: highlight the best match. Just opened: highlight the current value.
+                const current = normalizeFolderQuery(input.value);
+                const initialIndex = typed
+                    ? 0
+                    : Math.max(listOptions.findIndex((o) => o.folder.toLowerCase() === current), 0);
+                setActive(initialIndex);
             };
 
             // Open upward when the picker sits near the bottom of a scrolling list
@@ -556,7 +659,7 @@ app.registerExtension({
                     }
                     const spaceBelow = bottomLimit - rect.bottom;
                     const spaceAbove = rect.top - topLimit;
-                    return spaceBelow < 190 && spaceAbove > spaceBelow;
+                    return spaceBelow < FOLDER_DROPDOWN_MAX_HEIGHT + 10 && spaceAbove > spaceBelow;
                 })();
                 Object.assign(dropdown.style, flipUp
                     ? { top: "auto", bottom: "100%", borderTop: "1px solid var(--border-default)", borderBottom: "none", borderRadius: "8px 8px 0 0" }
@@ -564,17 +667,77 @@ app.registerExtension({
             };
 
             const showList = () => {
-                buildList();
                 positionDropdown();
                 dropdown.style.display = "block";
+                buildList();
             };
 
-            input.addEventListener("focus", showList);
-            input.addEventListener("input", showList);
-            input.addEventListener("blur", () => {
+            input.addEventListener("focus", () => {
+                valueAtFocus = input.value;
+                query = null;
+                showList();
+                // Select the current value so typing replaces it and starts filtering right away.
                 setTimeout(() => {
-                    dropdown.style.display = "none";
-                }, 150);
+                    if (document.activeElement === input) input.select();
+                }, 0);
+            });
+            let selectOnMouseUp = false;
+            input.addEventListener("mousedown", () => {
+                if (document.activeElement !== input) {
+                    // The click's mouseup would otherwise clear the select-all done on focus.
+                    selectOnMouseUp = true;
+                } else if (!isOpen()) {
+                    // Reopen when clicking an already-focused picker after choosing/escaping.
+                    query = null;
+                    showList();
+                }
+            });
+            input.addEventListener("mouseup", (event) => {
+                if (selectOnMouseUp) {
+                    selectOnMouseUp = false;
+                    event.preventDefault();
+                    input.select();
+                }
+            });
+            input.addEventListener("input", () => {
+                query = input.value;
+                showList();
+            });
+            input.addEventListener("keydown", (event) => {
+                if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                    event.preventDefault();
+                    if (!isOpen()) {
+                        showList();
+                        return;
+                    }
+                    if (!listOptions.length) return;
+                    const step = event.key === "ArrowDown" ? 1 : -1;
+                    setActive((activeIndex + step + listOptions.length) % listOptions.length);
+                } else if (event.key === "Enter") {
+                    if (isOpen() && listOptions[activeIndex]) {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        choose(listOptions[activeIndex].folder);
+                    }
+                } else if (event.key === "Escape") {
+                    if (isOpen()) {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        if (query !== null && input.value !== valueAtFocus) {
+                            input.value = valueAtFocus;
+                            input.dispatchEvent(new Event("change", { bubbles: true }));
+                        }
+                        close();
+                    }
+                } else if (event.key === "Tab") {
+                    // Tab accepts the highlighted match only while filtering.
+                    if (isOpen() && query !== null && listOptions[activeIndex] && !listOptions[activeIndex].isNew) {
+                        choose(listOptions[activeIndex].folder);
+                    }
+                }
+            });
+            input.addEventListener("blur", () => {
+                setTimeout(close, 150);
             });
 
             wrapper.appendChild(input);
@@ -582,7 +745,7 @@ app.registerExtension({
 
             const picker = {
                 refresh: () => {
-                    if (dropdown.style.display === "block") {
+                    if (isOpen()) {
                         buildList();
                     }
                 }
@@ -4346,9 +4509,14 @@ app.registerExtension({
             const repoDestinationFor = (file) => normalizeFolderPathInput(repoDestinations.get(file.path) || "");
 
             const styleDestinationInput = (input) => {
-                const missing = !normalizeFolderPathInput(input.value);
-                input.style.borderColor = missing ? MISSING_DESTINATION_BORDER : "var(--border-default)";
+                const value = normalizeFolderPathInput(input.value);
+                const missing = !value;
+                const isNewFolder = !missing && !availableFolders.some((f) => f.toLowerCase() === value.toLowerCase());
+                input.style.borderColor = missing
+                    ? MISSING_DESTINATION_BORDER
+                    : isNewFolder ? "#f5b14c" : "var(--border-default)";
                 input.style.background = missing ? MISSING_DESTINATION_BG : "var(--comfy-input-bg)";
+                input.title = isNewFolder ? `New folder: models/${value} will be created` : value ? `models/${value}` : "";
             };
 
             const createSmallSwitch = (labelText, onChange) => {
@@ -4527,7 +4695,7 @@ app.registerExtension({
             repoSection.appendChild(repoList);
             repoSection.appendChild(repoSummary);
 
-            const REPO_ROW_GRID = "20px minmax(0, 1fr) auto 72px minmax(160px, 260px)";
+            const REPO_ROW_GRID = "20px minmax(0, 1fr) 64px minmax(220px, 320px)";
 
             const updateRepoRowBadge = (file) => {
                 const refs = repoRowRefs.get(file.path);
@@ -4673,6 +4841,16 @@ app.registerExtension({
                         });
                         rowCheckboxes.push(checkbox);
 
+                        // Name and status badge share one grid cell so hiding the badge
+                        // doesn't shift the remaining cells into the wrong columns.
+                        const nameCell = document.createElement("div");
+                        Object.assign(nameCell.style, {
+                            display: "flex",
+                            alignItems: "center",
+                            gap: "8px",
+                            minWidth: "0",
+                        });
+
                         const nameEl = document.createElement("div");
                         nameEl.textContent = file.name;
                         nameEl.title = file.path;
@@ -4682,6 +4860,7 @@ app.registerExtension({
                             overflow: "hidden",
                             textOverflow: "ellipsis",
                             whiteSpace: "nowrap",
+                            minWidth: "0",
                         });
 
                         const badge = document.createElement("span");
@@ -4689,8 +4868,11 @@ app.registerExtension({
                             fontSize: "11px",
                             fontWeight: "600",
                             whiteSpace: "nowrap",
+                            flexShrink: "0",
                             display: "none",
                         });
+                        nameCell.appendChild(nameEl);
+                        nameCell.appendChild(badge);
 
                         const sizeEl = document.createElement("div");
                         sizeEl.textContent = formatRepoFileSize(file.size);
@@ -4721,8 +4903,7 @@ app.registerExtension({
                         });
 
                         row.appendChild(checkbox);
-                        row.appendChild(nameEl);
-                        row.appendChild(badge);
+                        row.appendChild(nameCell);
                         row.appendChild(sizeEl);
                         row.appendChild(picker.wrapper);
                         repoList.appendChild(row);
