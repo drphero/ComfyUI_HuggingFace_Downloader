@@ -4762,9 +4762,11 @@ app.registerExtension({
                 }
 
                 for (const [dir, groupFiles] of groups) {
-                    const groupHeader = document.createElement("label");
+                    // Header uses the row grid so its destination picker lines up with the file pickers.
+                    const groupHeader = document.createElement("div");
                     Object.assign(groupHeader.style, {
-                        display: "flex",
+                        display: "grid",
+                        gridTemplateColumns: REPO_ROW_GRID,
                         alignItems: "center",
                         gap: "10px",
                         padding: "8px 12px 4px",
@@ -4772,28 +4774,81 @@ app.registerExtension({
                         fontWeight: "600",
                         letterSpacing: "0.03em",
                         color: "var(--descrip-text, #9aa1ad)",
-                        cursor: "pointer",
                         userSelect: "none",
                     });
                     const groupCheckbox = document.createElement("input");
                     groupCheckbox.type = "checkbox";
-                    groupCheckbox.style.margin = "0";
+                    Object.assign(groupCheckbox.style, { margin: "0", cursor: "pointer" });
                     const groupText = document.createElement("span");
                     groupText.textContent = `${dir || "(repo root)"}  ·  ${groupFiles.length}`;
+                    groupText.title = dir || "(repo root)";
+                    Object.assign(groupText.style, {
+                        cursor: "pointer",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                        minWidth: "0",
+                    });
+                    groupText.addEventListener("click", () => groupCheckbox.click());
+                    const groupSize = document.createElement("span");
+                    groupSize.textContent = formatRepoFileSize(groupFiles.reduce((sum, f) => sum + (Number(f.size) || 0), 0));
+                    Object.assign(groupSize.style, {
+                        fontWeight: "500",
+                        textAlign: "right",
+                        fontVariantNumeric: "tabular-nums",
+                    });
                     groupHeader.appendChild(groupCheckbox);
                     groupHeader.appendChild(groupText);
-                    const groupSuggested = normalizeFolderPathInput(groupFiles[0].suggested_folder);
-                    const groupHint = document.createElement("span");
-                    Object.assign(groupHint.style, { fontWeight: "500", letterSpacing: "0" });
-                    if (groupFiles.every((f) => normalizeFolderPathInput(f.suggested_folder) === groupSuggested) && groupSuggested) {
-                        groupHint.textContent = `→ models/${groupSuggested}`;
-                        groupHint.style.color = "#5bd98c";
-                    } else if (!groupSuggested) {
-                        groupHint.textContent = "choose a destination";
-                        groupHint.style.color = "#f5b14c";
-                    }
-                    groupHeader.appendChild(groupHint);
+                    groupHeader.appendChild(groupSize);
                     repoList.appendChild(groupHeader);
+
+                    // Group destination: shows the folder shared by every file in the group (or
+                    // "Mixed"), and picking a folder applies it to all of them.
+                    let groupPicker = null;
+                    const syncGroupPicker = () => {
+                        if (!groupPicker || document.activeElement === groupPicker.input) return;
+                        const destinations = new Set(groupFiles.map(repoDestinationFor));
+                        const common = destinations.size === 1 ? [...destinations][0] : null;
+                        groupPicker.input.value = common ?? "";
+                        groupPicker.input.placeholder = common === null ? "Mixed: set all…" : "Set folder for all…";
+                        if (common === null) {
+                            groupPicker.input.style.borderColor = "var(--border-default)";
+                            groupPicker.input.style.background = "var(--comfy-input-bg)";
+                            groupPicker.input.title = "Files in this group go to different folders. Pick one to apply it to all.";
+                        } else {
+                            styleDestinationInput(groupPicker.input);
+                        }
+                    };
+                    if (groupFiles.length > 1) {
+                        groupPicker = createFolderPicker("", "Set folder for all…", { autoFlip: true });
+                        repoPickers.push(groupPicker);
+                        Object.assign(groupPicker.input.style, {
+                            minHeight: "30px",
+                            padding: "3px 10px",
+                            fontSize: "13px",
+                            letterSpacing: "0",
+                        });
+                        groupPicker.input.addEventListener("change", (event) => {
+                            // Apply only explicit picks (dropdown click, Enter, Tab). The browser's own
+                            // change-on-blur after partial typing is ignored and the display restored.
+                            if (event.isTrusted) return;
+                            const dest = normalizeFolderPathInput(groupPicker.input.value);
+                            if (!dest) return;
+                            groupFiles.forEach((f) => {
+                                repoDestinations.set(f.path, dest);
+                                const refs = repoRowRefs.get(f.path);
+                                if (refs) {
+                                    refs.input.value = dest;
+                                    styleDestinationInput(refs.input);
+                                }
+                                updateRepoRowBadge(f);
+                            });
+                            styleDestinationInput(groupPicker.input);
+                            updateRepoSelectionUi();
+                        });
+                        groupPicker.input.addEventListener("blur", () => setTimeout(syncGroupPicker, 160));
+                        groupHeader.appendChild(groupPicker.wrapper);
+                    }
 
                     const rowCheckboxes = [];
                     const syncGroupCheckbox = () => {
@@ -4891,6 +4946,7 @@ app.registerExtension({
                             repoDestinations.set(file.path, picker.input.value);
                             styleDestinationInput(picker.input);
                             updateRepoRowBadge(file);
+                            syncGroupPicker();
                             updateRepoSelectionUi();
                         };
                         picker.input.addEventListener("input", onDestinationChange);
@@ -4912,6 +4968,7 @@ app.registerExtension({
                         updateRepoRowBadge(file);
                     }
                     syncGroupCheckbox();
+                    syncGroupPicker();
                 }
                 updateRepoSelectionUi();
             };
