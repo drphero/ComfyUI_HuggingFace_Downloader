@@ -76,6 +76,61 @@ class TestSuggestModelFolder(unittest.TestCase):
         self.assertEqual(fm.suggest_model_folder("split_files/text_encoders/t5.safetensors"), "text_encoders")
 
 
+class TestGuessModelFolderFromName(unittest.TestCase):
+
+    def guess(self, path, folder_types=FOLDER_TYPES + ["vae_approx", "latent_upscale_models", "audio_encoders"]):
+        return fm.guess_model_folder_from_name(path, folder_types)
+
+    def test_real_world_names(self):
+        cases = {
+            # Kijai/WanVideo_comfy root files
+            "Wan21_CausVid_14B_T2V_lora_rank32.safetensors": "loras",
+            "UniAnimate-Wan2.1-14B-Lora-12000-fp16.safetensors": "loras",
+            "Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank128_bf16.safetensors": "loras",
+            "Wan2_1_VAE_bf16.safetensors": "vae",
+            "taew2_1.safetensors": "vae_approx",
+            "umt5-xxl-enc-bf16.safetensors": "text_encoders",
+            "open-clip-xlm-roberta-large-vit-huge-14_visual_fp16.safetensors": "clip_vision",
+            "Wan21_Uni3C_controlnet_fp16.safetensors": "controlnet",
+            "HuMo/whisper_large_v3_encoder_fp16.safetensors": "audio_encoders",
+            "Wan2_1-T2V-14B_fp8_e4m3fn.safetensors": "diffusion_models",
+            "Phantom-Wan-14B_fp16.safetensors": "diffusion_models",
+            "Qwen/Qwen2.5_7B_instruct_bf16.safetensors": "text_encoders",
+            # FLUX
+            "ae.safetensors": "vae",
+            "flux1-schnell.safetensors": "diffusion_models",
+            "flux-vae-bf16.safetensors": "vae",
+            "flux_shakker_labs_union_pro-fp8_e4m3fn.safetensors": "controlnet",
+            "clip_l.safetensors": "text_encoders",
+            "t5xxl_fp8_e4m3fn_scaled.safetensors": "text_encoders",
+            # Misc
+            "RealESRGAN_x4plus.pth": "upscale_models",
+            "4x-UltraSharp.pth": "upscale_models",
+            "qwen_image_fp8_e4m3fn.safetensors": "diffusion_models",
+            "sd_xl_base_1.0.safetensors": "checkpoints",
+        }
+        for path, expected in cases.items():
+            with self.subTest(path=path):
+                self.assertEqual(self.guess(path), expected)
+
+    def test_specific_rules_beat_model_family(self):
+        # Family names (flux, wan) appear in LoRA/VAE names but must not win.
+        self.assertEqual(self.guess("flux_realism_lora.safetensors"), "loras")
+        self.assertEqual(self.guess("wan_2.1_vae.safetensors"), "vae")
+
+    def test_no_match(self):
+        self.assertEqual(self.guess("body_pose_model.pth"), "")
+        self.assertEqual(self.guess("model.safetensors"), "")
+        # Short tokens must not match inside other words.
+        self.assertEqual(self.guess("swan_lake_portrait.safetensors"), "")
+        self.assertEqual(self.guess("explorations.safetensors"), "")
+
+    def test_unavailable_folder_gives_no_hint(self):
+        # The first matching rule decides; no fallback to a looser rule.
+        self.assertEqual(fm.guess_model_folder_from_name("taew2_1.safetensors", FOLDER_TYPES), "")
+        self.assertEqual(fm.guess_model_folder_from_name("ltx_latent_upscaler.safetensors", FOLDER_TYPES), "")
+
+
 class TestListHfRepoFiles(unittest.TestCase):
 
     def _list(self, link, entries):
@@ -140,6 +195,37 @@ class TestListHfRepoFiles(unittest.TestCase):
         result, _ = self._list("someone/diffusers-repo", entries)
         self.assertTrue(result["is_diffusers"])
         self.assertTrue(all(f["suggested_folder"] == "" for f in result["files"]))
+
+    def test_hint_folder_only_for_unrouted_model_files(self):
+        entries = [
+            _repo_file("README.md"),
+            _repo_file("ae.safetensors"),
+            _repo_file("my_style_lora.safetensors"),
+            _repo_file("vae/wan_vae.safetensors"),
+            _repo_file("mystery.safetensors"),
+        ]
+        result, _ = self._list("someone/mixed-repo", entries)
+        by_path = {f["path"]: f for f in result["files"]}
+        self.assertEqual(by_path["ae.safetensors"]["hint_folder"], "vae")
+        self.assertEqual(by_path["my_style_lora.safetensors"]["hint_folder"], "loras")
+        self.assertEqual(by_path["README.md"]["hint_folder"], "")
+        self.assertEqual(by_path["mystery.safetensors"]["hint_folder"], "")
+        # Already routed by its folder, so no hint.
+        self.assertEqual(by_path["vae/wan_vae.safetensors"]["suggested_folder"], "vae")
+        self.assertEqual(by_path["vae/wan_vae.safetensors"]["hint_folder"], "")
+
+    def test_diffusers_repo_hints_root_files_only(self):
+        entries = [
+            _repo_file("model_index.json"),
+            _repo_file("ae.safetensors"),
+            _repo_file("flux1-schnell.safetensors"),
+            _repo_file("vae/diffusion_pytorch_model.safetensors"),
+        ]
+        result, _ = self._list("black-forest-labs/FLUX.1-schnell", entries)
+        by_path = {f["path"]: f for f in result["files"]}
+        self.assertEqual(by_path["ae.safetensors"]["hint_folder"], "vae")
+        self.assertEqual(by_path["flux1-schnell.safetensors"]["hint_folder"], "diffusion_models")
+        self.assertEqual(by_path["vae/diffusion_pytorch_model.safetensors"]["hint_folder"], "")
 
 
 if __name__ == "__main__":

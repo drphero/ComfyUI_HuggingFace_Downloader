@@ -4709,6 +4709,25 @@ app.registerExtension({
 
             const REPO_ROW_GRID = "20px minmax(0, 1fr) 64px minmax(220px, 320px)";
 
+            // Show the filename-based suggestion chip only while the file has no destination.
+            const updateRowHintChip = (file) => {
+                const refs = repoRowRefs.get(file.path);
+                if (!refs?.hintChip) return;
+                refs.hintChip.style.display = !repoDestinationFor(file) && file.hint_folder ? "" : "none";
+            };
+
+            // Set one file's destination and refresh its row (input, border, badge, hint chip).
+            const setFileDestination = (file, dest) => {
+                repoDestinations.set(file.path, dest);
+                const refs = repoRowRefs.get(file.path);
+                if (refs) {
+                    refs.input.value = dest;
+                    styleDestinationInput(refs.input);
+                }
+                updateRepoRowBadge(file);
+                updateRowHintChip(file);
+            };
+
             const updateRepoRowBadge = (file) => {
                 const refs = repoRowRefs.get(file.path);
                 if (!refs) return;
@@ -4919,6 +4938,36 @@ app.registerExtension({
                         minWidth: "0",
                     });
                     groupText.addEventListener("click", () => groupCheckbox.click());
+                    const groupTextCell = document.createElement("div");
+                    Object.assign(groupTextCell.style, {
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "12px",
+                        minWidth: "0",
+                    });
+                    groupTextCell.appendChild(groupText);
+                    // Fills each empty destination in the group with its own filename-based guess.
+                    const groupHintsBtn = createLinkButton("", () => {
+                        groupFiles.forEach((f) => {
+                            if (!repoDestinationFor(f) && f.hint_folder) setFileDestination(f, f.hint_folder);
+                        });
+                        syncGroupPicker();
+                        updateRepoSelectionUi();
+                    });
+                    Object.assign(groupHintsBtn.style, {
+                        fontSize: "12px",
+                        fontWeight: "600",
+                        letterSpacing: "0",
+                        whiteSpace: "nowrap",
+                        flexShrink: "0",
+                    });
+                    groupHintsBtn.title = "Use the folder guessed from each file's name for every file in this group that has no destination yet";
+                    groupTextCell.appendChild(groupHintsBtn);
+                    const syncGroupHints = () => {
+                        const n = groupFiles.filter((f) => !repoDestinationFor(f) && f.hint_folder).length;
+                        groupHintsBtn.textContent = `Apply ${n} suggestion${n === 1 ? "" : "s"}`;
+                        groupHintsBtn.style.display = n > 1 ? "" : "none";
+                    };
                     const groupSize = document.createElement("span");
                     groupSize.textContent = formatRepoFileSize(groupFiles.reduce((sum, f) => sum + (Number(f.size) || 0), 0));
                     Object.assign(groupSize.style, {
@@ -4927,7 +4976,7 @@ app.registerExtension({
                         fontVariantNumeric: "tabular-nums",
                     });
                     groupHeader.appendChild(groupCheckbox);
-                    groupHeader.appendChild(groupText);
+                    groupHeader.appendChild(groupTextCell);
                     groupHeader.appendChild(groupSize);
                     repoList.appendChild(groupHeader);
 
@@ -4935,6 +4984,7 @@ app.registerExtension({
                     // "Mixed"), and picking a folder applies it to all of them.
                     let groupPicker = null;
                     const syncGroupPicker = () => {
+                        syncGroupHints();
                         if (!groupPicker || document.activeElement === groupPicker.input) return;
                         const destinations = new Set(groupFiles.map(repoDestinationFor));
                         const common = destinations.size === 1 ? [...destinations][0] : null;
@@ -4963,16 +5013,9 @@ app.registerExtension({
                             if (event.isTrusted) return;
                             const dest = normalizeFolderPathInput(groupPicker.input.value);
                             if (!dest) return;
-                            groupFiles.forEach((f) => {
-                                repoDestinations.set(f.path, dest);
-                                const refs = repoRowRefs.get(f.path);
-                                if (refs) {
-                                    refs.input.value = dest;
-                                    styleDestinationInput(refs.input);
-                                }
-                                updateRepoRowBadge(f);
-                            });
+                            groupFiles.forEach((f) => setFileDestination(f, dest));
                             styleDestinationInput(groupPicker.input);
+                            syncGroupHints();
                             updateRepoSelectionUi();
                         });
                         groupPicker.input.addEventListener("blur", () => setTimeout(syncGroupPicker, 160));
@@ -5058,6 +5101,34 @@ app.registerExtension({
                         nameCell.appendChild(nameEl);
                         nameCell.appendChild(badge);
 
+                        let hintChip = null;
+                        if (file.hint_folder) {
+                            hintChip = document.createElement("button");
+                            hintChip.type = "button";
+                            hintChip.textContent = `Use ${file.hint_folder}`;
+                            hintChip.title = `Suggested from the filename: models/${file.hint_folder}. Check it before downloading.`;
+                            Object.assign(hintChip.style, {
+                                marginLeft: "auto",
+                                flexShrink: "0",
+                                padding: "1px 8px",
+                                borderRadius: "999px",
+                                border: "1px dashed var(--p-primary-color, #6aa9ff)",
+                                background: "transparent",
+                                color: "var(--p-primary-color, #6aa9ff)",
+                                fontSize: "11px",
+                                fontWeight: "600",
+                                whiteSpace: "nowrap",
+                                cursor: "pointer",
+                            });
+                            hintChip.addEventListener("click", (event) => {
+                                event.stopPropagation(); // don't toggle the row's checkbox
+                                setFileDestination(file, file.hint_folder);
+                                syncGroupPicker();
+                                updateRepoSelectionUi();
+                            });
+                            nameCell.appendChild(hintChip);
+                        }
+
                         const sizeEl = document.createElement("div");
                         sizeEl.textContent = formatRepoFileSize(file.size);
                         Object.assign(sizeEl.style, {
@@ -5075,6 +5146,7 @@ app.registerExtension({
                             repoDestinations.set(file.path, picker.input.value);
                             styleDestinationInput(picker.input);
                             updateRepoRowBadge(file);
+                            updateRowHintChip(file);
                             syncGroupPicker();
                             updateRepoSelectionUi();
                         };
@@ -5093,8 +5165,9 @@ app.registerExtension({
                         row.appendChild(picker.wrapper);
                         repoList.appendChild(row);
 
-                        repoRowRefs.set(file.path, { input: picker.input, badge });
+                        repoRowRefs.set(file.path, { input: picker.input, badge, hintChip });
                         updateRepoRowBadge(file);
+                        updateRowHintChip(file);
                     }
                     syncGroupCheckbox();
                     syncGroupPicker();
@@ -5160,7 +5233,7 @@ app.registerExtension({
                     showAllRepoFiles = files.length > 0 && !files.some((f) => f.is_model);
                     showAllSwitch.set(showAllRepoFiles);
                     if (data.is_diffusers) {
-                        repoNotice.textContent = "This looks like a diffusers-format repo (model_index.json). Its component folders are usually not loadable by ComfyUI's standard loaders, so no destinations were suggested.";
+                        repoNotice.textContent = "This looks like a diffusers-format repo (model_index.json). Its component folders are usually not loadable by ComfyUI's standard loaders, so they get no destination; single-file models in the repo root may still have suggestions.";
                         repoNotice.style.display = "block";
                     } else {
                         repoNotice.style.display = "none";

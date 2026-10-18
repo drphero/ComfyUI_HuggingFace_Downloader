@@ -30,6 +30,7 @@ from .file_manager import (
     sanitize_rel_folder,
     get_model_folder_types,
     suggest_model_folder,
+    guess_model_folder_from_name,
 )
 from .model_discovery import process_workflow_for_missing_models, SearchCancelledException
 from .downloader import (
@@ -2412,6 +2413,11 @@ def _list_hf_repo_files(link: str) -> dict:
         name = os.path.basename(path)
         is_model = name.lower().endswith(REPO_BROWSER_MODEL_EXTENSIONS)
         suggested = "" if is_diffusers else suggest_model_folder(path, folder_types)
+        # Filename-based guess, offered in the UI as a hint rather than filled in. In diffusers
+        # repos only root files qualify; component folders (unet/, vae/...) aren't ComfyUI models.
+        hint = ""
+        if is_model and not suggested and not (is_diffusers and os.path.dirname(path)):
+            hint = guess_model_folder_from_name(path, folder_types)
         exists = False
         if suggested:
             try:
@@ -2425,6 +2431,7 @@ def _list_hf_repo_files(link: str) -> dict:
             "size": entry.size,
             "is_model": is_model,
             "suggested_folder": suggested,
+            "hint_folder": hint,
             "exists": exists,
         })
     files.sort(key=lambda f: (f["dir"].lower(), f["name"].lower()))
