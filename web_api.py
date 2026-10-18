@@ -2855,18 +2855,84 @@ async def delete_from_hf_backup_endpoint(request):
     except Exception as e:
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
+def _nearest_existing_path(path: str) -> str:
+    current = os.path.abspath(path)
+    while not os.path.exists(current):
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return current
+
+
+def _mount_point(path: str) -> str:
+    current = os.path.realpath(path)
+    while not os.path.ismount(current):
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return current
+
+
+def _disk_volumes_for_folders(folders: list[str]) -> dict:
+    """
+    Map destination folders (and the HF download cache) to the volumes they live on,
+    since a folder may resolve to a different disk via extra_model_paths.
+    """
+    volumes: dict[str, dict] = {}
+    folder_volumes: dict[str, str] = {}
+
+    def volume_id_for(path: str) -> str:
+        existing = _nearest_existing_path(path)
+        volume_id = str(os.stat(existing).st_dev)
+        if volume_id not in volumes:
+            total, used, free = shutil.disk_usage(existing)
+            volumes[volume_id] = {
+                "mount": _mount_point(existing),
+                "total": total,
+                "used": used,
+                "free": free,
+            }
+        return volume_id
+
+    for folder in folders:
+        try:
+            folder_volumes[folder] = volume_id_for(resolve_target_dir(folder))
+        except Exception as e:
+            print(f"[DEBUG] Disk space lookup failed for folder '{folder}': {e}")
+
+    cache_volume = None
+    try:
+        from .downloader import _get_hf_cache_dir
+        cache_volume = volume_id_for(_get_hf_cache_dir())
+    except Exception as e:
+        print(f"[DEBUG] Disk space lookup failed for HF cache: {e}")
+
+    return {"volumes": volumes, "folders": folder_volumes, "cache_volume": cache_volume}
+
+
 async def get_disk_space(request):
+    """
+    Free space on the models disk. With one or more `folder` query params, also report
+    the volume each destination folder (and the HF download cache) resolves to.
+    """
     try:
         path = _get_models_root()
         if not os.path.exists(path):
             from .file_manager import get_comfy_root
             path = get_comfy_root()
         total, used, free = shutil.disk_usage(path)
-        return web.json_response({
+        result = {
             "total": total,
             "used": used,
             "free": free
-        })
+        }
+        # Keyed by the folder as requested; resolve_target_dir sanitizes it before use.
+        folders = [v for v in request.query.getall("folder", []) if sanitize_rel_folder(v)]
+        if folders:
+            result.update(await asyncio.to_thread(_disk_volumes_for_folders, folders))
+        return web.json_response(result)
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 

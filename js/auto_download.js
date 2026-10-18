@@ -4675,7 +4675,9 @@ app.registerExtension({
 
             const repoList = document.createElement("div");
             Object.assign(repoList.style, {
-                maxHeight: "min(50vh, 480px)",
+                // Leave room for the dialog chrome above and the summary, space warnings and
+                // footer below so the Download button stays on screen (panel max is 92vh).
+                maxHeight: "max(180px, min(480px, calc(92vh - 480px)))",
                 overflowY: "auto",
                 border: "1px solid var(--border-default)",
                 borderRadius: "8px",
@@ -4689,11 +4691,21 @@ app.registerExtension({
                 color: "var(--descrip-text, #9aa1ad)",
             });
 
+            const repoSpaceWarning = document.createElement("div");
+            Object.assign(repoSpaceWarning.style, {
+                display: "none",
+                flexDirection: "column",
+                gap: "2px",
+                fontSize: "13px",
+                lineHeight: "1.4",
+            });
+
             repoSection.appendChild(repoHeader);
             repoSection.appendChild(repoNotice);
             repoSection.appendChild(bulkRow);
             repoSection.appendChild(repoList);
             repoSection.appendChild(repoSummary);
+            repoSection.appendChild(repoSpaceWarning);
 
             const REPO_ROW_GRID = "20px minmax(0, 1fr) 64px minmax(220px, 320px)";
 
@@ -4715,18 +4727,135 @@ app.registerExtension({
                 }
             };
 
+            /* ── Disk space: free space per destination volume vs. what the selection needs ── */
+            const DISK_INFO_MAX_AGE_MS = 15000;
+            let diskInfo = null; // /disk_space response for diskInfoKey
+            let diskInfoKey = null;
+            let diskInfoFetchedAt = 0;
+            let diskInfoRequestId = 0;
+            let diskInfoTimer = null;
+            let spaceOverrideKey = null; // selection the user chose to download despite a space warning
+            // Bytes still to be written for files queued from this listing: path -> { folder, remaining }
+            const repoPendingBytes = new Map();
+
+            const selectedRepoFiles = () => visibleRepoFiles().filter((f) => repoSelected.has(f.path));
+            // Files the downloader will skip because they already exist at the destination.
+            const isAlreadyInstalled = (f) =>
+                f.exists && repoDestinationFor(f) === normalizeFolderPathInput(f.suggested_folder);
+
+            const diskFoldersKey = () => {
+                const folders = new Set(selectedRepoFiles().map(repoDestinationFor).filter(Boolean));
+                repoPendingBytes.forEach((p) => folders.add(p.folder));
+                return [...folders].sort().join("\n");
+            };
+
+            const fetchDiskInfo = async () => {
+                const key = diskFoldersKey();
+                const requestId = ++diskInfoRequestId;
+                const params = new URLSearchParams();
+                key.split("\n").filter(Boolean).forEach((folder) => params.append("folder", folder));
+                try {
+                    const resp = await fetch(`/hf_downloader_model_explorer_v2/disk_space?${params}`);
+                    const data = await resp.json();
+                    if (requestId !== diskInfoRequestId || !resp.ok || data.error) return;
+                    diskInfo = data;
+                    diskInfoKey = key;
+                    diskInfoFetchedAt = Date.now();
+                    if (repoListing) updateRepoSelectionUi();
+                } catch (e) {
+                    console.warn("[AutoDownload] Disk space lookup failed:", e);
+                }
+            };
+
+            const scheduleDiskInfoRefresh = () => {
+                const stale = Date.now() - diskInfoFetchedAt > DISK_INFO_MAX_AGE_MS;
+                if (diskInfoKey === diskFoldersKey() && !stale) return;
+                clearTimeout(diskInfoTimer);
+                diskInfoTimer = setTimeout(fetchDiskInfo, 250);
+            };
+
+            // Per-volume space plan for the current selection, or null until disk info covers it.
+            // Downloads land in the HF cache before being copied into place (one at a time), so the
+            // cache's volume also needs room for the largest file while it is being copied.
+            const computeSpacePlan = () => {
+                const files = selectedRepoFiles().filter((f) => repoDestinationFor(f) && !isAlreadyInstalled(f));
+                if (!diskInfo || diskInfoKey !== diskFoldersKey()) return null;
+                if (!files.length) return { volumes: [], insufficient: [], tight: [] };
+                const volumeInfo = diskInfo.volumes || {};
+                const folderVolumes = diskInfo.folders || {};
+                const needs = new Map();
+                const addNeed = (volumeId, bytes, field) => {
+                    if (!volumeId || !volumeInfo[volumeId]) return;
+                    if (!needs.has(volumeId)) needs.set(volumeId, { id: volumeId, files: 0, pending: 0, cache: 0 });
+                    needs.get(volumeId)[field] += bytes;
+                };
+                files.forEach((f) => addNeed(folderVolumes[repoDestinationFor(f)], Number(f.size) || 0, "files"));
+                repoPendingBytes.forEach((p) => addNeed(folderVolumes[p.folder], p.remaining, "pending"));
+                const largest = Math.max(...files.map((f) => Number(f.size) || 0));
+                addNeed(diskInfo.cache_volume, largest, "cache");
+
+                const volumes = [...needs.values()].map((v) => {
+                    const info = volumeInfo[v.id];
+                    return { ...v, mount: info.mount, free: info.free, total: info.total, need: v.files + v.pending + v.cache };
+                });
+                return {
+                    volumes,
+                    insufficient: volumes.filter((v) => v.need > v.free),
+                    tight: volumes.filter((v) => v.need <= v.free && v.need > v.free * 0.9),
+                };
+            };
+
+            const selectionSignature = () =>
+                selectedRepoFiles().map((f) => `${f.path}\t${repoDestinationFor(f)}`).sort().join("\n");
+
+            const describeVolumeNeed = (v) => {
+                const extras = [];
+                if (v.pending) extras.push(`${formatRepoFileSize(v.pending)} still downloading from earlier`);
+                if (v.cache) extras.push(`${formatRepoFileSize(v.cache)} temporary download cache`);
+                return `needs ${formatRepoFileSize(v.need)}${extras.length ? ` (incl. ${extras.join(", ")})` : ""}, ${formatRepoFileSize(v.free)} free`;
+            };
+
+            const updateRepoSpaceUi = (plan) => {
+                repoSpaceWarning.innerHTML = "";
+                const lines = [];
+                (plan?.insufficient || []).forEach((v) => lines.push([`Not enough space on ${v.mount}: ${describeVolumeNeed(v)}.`, "#ff6b6b"]));
+                (plan?.tight || []).forEach((v) => lines.push([`Space is tight on ${v.mount}: ${describeVolumeNeed(v)}.`, "#f5b14c"]));
+                lines.forEach(([text, color]) => {
+                    const line = document.createElement("div");
+                    line.textContent = text;
+                    line.style.color = color;
+                    repoSpaceWarning.appendChild(line);
+                });
+                repoSpaceWarning.style.display = lines.length ? "flex" : "none";
+            };
+
             const updateRepoSelectionUi = () => {
                 const visible = visibleRepoFiles();
                 const selected = visible.filter((f) => repoSelected.has(f.path));
                 const totalBytes = selected.reduce((sum, f) => sum + (Number(f.size) || 0), 0);
                 const missing = selected.filter((f) => !repoDestinationFor(f)).length;
+                scheduleDiskInfoRefresh();
+                const plan = computeSpacePlan();
+
                 let summary = `${selected.length} of ${visible.length} selected`;
                 if (selected.length) summary += ` · ${formatRepoFileSize(totalBytes)}`;
+                if (plan?.volumes.length > 1) {
+                    summary += ` · free: ${plan.volumes.map((v) => `${v.mount} ${formatRepoFileSize(v.free)}`).join(", ")}`;
+                } else if (plan?.volumes.length === 1) {
+                    summary += ` · ${formatRepoFileSize(plan.volumes[0].free)} free`;
+                } else if (diskInfo) {
+                    summary += ` · ${formatRepoFileSize(diskInfo.free)} free`;
+                }
                 if (missing) summary += ` · ${missing} need a destination folder`;
                 repoSummary.textContent = summary;
                 repoSummary.style.color = missing ? "#f5b14c" : "var(--descrip-text, #9aa1ad)";
+                updateRepoSpaceUi(plan);
+
                 if (downloadBtnRef) {
-                    downloadBtnRef.textContent = selected.length ? `Download ${selected.length} selected` : "Download";
+                    const overridden = plan?.insufficient.length && spaceOverrideKey === selectionSignature();
+                    downloadBtnRef.textContent = !selected.length
+                        ? "Download"
+                        : overridden ? `Download ${selected.length} anyway` : `Download ${selected.length} selected`;
                     downloadBtnRef.disabled = !selected.length;
                     downloadBtnRef.style.opacity = selected.length ? "1" : "0.5";
                 }
@@ -4991,6 +5120,8 @@ app.registerExtension({
                 repoSelected.clear();
                 repoDestinations.clear();
                 repoRowStatus.clear();
+                repoPendingBytes.clear();
+                spaceOverrideKey = null;
                 repoPickers.forEach((picker) => picker.destroy());
                 repoPickers = [];
                 repoRowRefs = new Map();
@@ -5023,6 +5154,8 @@ app.registerExtension({
                     repoSelected.clear();
                     repoDestinations.clear();
                     repoRowStatus.clear();
+                    repoPendingBytes.clear();
+                    spaceOverrideKey = null;
                     files.forEach((f) => repoDestinations.set(f.path, f.suggested_folder || ""));
                     showAllRepoFiles = files.length > 0 && !files.some((f) => f.is_model);
                     showAllSwitch.set(showAllRepoFiles);
@@ -5065,6 +5198,24 @@ app.registerExtension({
                     return;
                 }
 
+                // Check free space against fresh numbers. The first click on a selection that doesn't
+                // fit is blocked with a warning; clicking "Download anyway" queues it regardless.
+                await fetchDiskInfo();
+                const plan = computeSpacePlan();
+                const signature = selectionSignature();
+                if (plan?.insufficient.length && spaceOverrideKey !== signature) {
+                    spaceOverrideKey = signature;
+                    updateRepoSelectionUi();
+                    showToast({
+                        severity: "error",
+                        summary: "Not enough disk space",
+                        detail: plan.insufficient.map((v) => `${v.mount}: ${describeVolumeNeed(v)}.`).join("\n")
+                            + "\nFree up space, change destinations, or click “Download anyway” to queue regardless."
+                    });
+                    return;
+                }
+                spaceOverrideKey = null;
+
                 const models = files.map((f) => ({
                     url: buildRepoFileUrl(f),
                     filename: f.name,
@@ -5085,7 +5236,12 @@ app.registerExtension({
                             const aligned = !rejectedItems.length && queuedItems.length === files.length;
                             queuedItems.forEach((q, i) => {
                                 const file = aligned ? files[i] : files.find((f) => f.name === q.filename);
-                                if (q?.download_id && file) idToFile.set(q.download_id, file);
+                                if (q?.download_id && file) {
+                                    idToFile.set(q.download_id, file);
+                                    if (!isAlreadyInstalled(file)) {
+                                        repoPendingBytes.set(file.path, { folder: repoDestinationFor(file), remaining: Number(file.size) || 0 });
+                                    }
+                                }
                             });
                         },
                         onStatus: (id, info) => {
@@ -5094,6 +5250,16 @@ app.registerExtension({
                             if (repoRowStatus.get(file.path) !== info.status) {
                                 repoRowStatus.set(file.path, info.status);
                                 updateRepoRowBadge(file);
+                            }
+                            const pending = repoPendingBytes.get(file.path);
+                            if (pending) {
+                                if (TERMINAL_DOWNLOAD_STATUSES.has(info.status)) {
+                                    repoPendingBytes.delete(file.path);
+                                } else {
+                                    const written = Number(info.downloaded_bytes) || 0;
+                                    pending.remaining = Math.max((Number(file.size) || 0) - written, 0);
+                                }
+                                updateRepoSelectionUi();
                             }
                         },
                         onFinished: (failures, total) => {
