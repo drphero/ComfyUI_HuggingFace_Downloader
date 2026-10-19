@@ -4798,8 +4798,9 @@ app.registerExtension({
             };
 
             // Per-volume space plan for the current selection, or null until disk info covers it.
-            // Downloads land in the HF cache before being copied into place (one at a time), so the
-            // cache's volume also needs room for the largest file while it is being copied.
+            // Downloads land in the HF cache and are then moved into place, one at a time. On the
+            // cache's own volume that move is a rename, but a file headed to another volume is
+            // copied, so the cache volume briefly needs room for the largest such file.
             const computeSpacePlan = () => {
                 const files = selectedRepoFiles().filter((f) => repoDestinationFor(f) && !isAlreadyInstalled(f));
                 if (!diskInfo || diskInfoKey !== diskFoldersKey()) return null;
@@ -4814,8 +4815,12 @@ app.registerExtension({
                 };
                 files.forEach((f) => addNeed(folderVolumes[repoDestinationFor(f)], Number(f.size) || 0, "files"));
                 repoPendingBytes.forEach((p) => addNeed(folderVolumes[p.folder], p.remaining, "pending"));
-                const largest = Math.max(...files.map((f) => Number(f.size) || 0));
-                addNeed(diskInfo.cache_volume, largest, "cache");
+                const crossVolumeSizes = files
+                    .filter((f) => folderVolumes[repoDestinationFor(f)] !== diskInfo.cache_volume)
+                    .map((f) => Number(f.size) || 0);
+                if (crossVolumeSizes.length) {
+                    addNeed(diskInfo.cache_volume, Math.max(...crossVolumeSizes), "cache");
+                }
 
                 const volumes = [...needs.values()].map((v) => {
                     const info = volumeInfo[v.id];
